@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Relay - Cost Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background:#0b0f14; color:#e6edf3; margin:0; padding:2rem; }
+  h1 { font-size:1.4rem; margin-bottom:0.25rem; }
+  p.sub { color:#8b949e; margin-top:0; }
+  .card { background:#161b22; border:1px solid #30363d; border-radius:12px; padding:1.5rem; margin-top:1.5rem; }
+  table { width:100%; border-collapse: collapse; font-size:0.85rem; }
+  th, td { text-align:left; padding:0.4rem 0.6rem; border-bottom:1px solid #30363d; }
+  th { color:#8b949e; font-weight:500; }
+  #empty { color:#8b949e; padding:2rem; text-align:center; }
+</style>
+</head>
+<body>
+  <h1>Relay Cost Dashboard</h1>
+  <p class="sub">Cost and request volume by provider &amp; model</p>
+
+  <div class="card">
+    <canvas id="costChart" height="90"></canvas>
+  </div>
+
+  <div class="card">
+    <table id="summaryTable">
+      <thead><tr><th>Day</th><th>Provider</th><th>Model</th><th>Requests</th><th>Cost (USD)</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div id="empty" style="display:none;">No usage yet — send a request to /v1/chat/completions first.</div>
+  </div>
+
+<script>
+async function load() {
+  const res = await fetch('/v1/usage/summary');
+  const rows = await res.json();
+  const tbody = document.querySelector('#summaryTable tbody');
+
+  if (rows.length === 0) {
+    document.getElementById('empty').style.display = 'block';
+    return;
+  }
+
+  const byDay = {};
+  for (const r of rows) {
+    const day = r.day ? r.day.slice(0, 10) : 'unknown';
+    tbody.insertAdjacentHTML('beforeend',
+      `<tr><td>${day}</td><td>${r.provider}</td><td>${r.model}</td><td>${r.requests}</td><td>$${r.total_cost.toFixed(6)}</td></tr>`);
+    byDay[day] = (byDay[day] || 0) + r.total_cost;
+  }
+
+  const days = Object.keys(byDay).sort();
+  new Chart(document.getElementById('costChart'), {
+    type: 'bar',
+    data: {
+      labels: days,
+      datasets: [{ label: 'Cost (USD)', data: days.map(d => byDay[d]), backgroundColor: '#58a6ff' }],
+    },
+    options: {
+      scales: {
+        x: { ticks: { color: '#8b949e' }, grid: { color: '#30363d' } },
+        y: { ticks: { color: '#8b949e' }, grid: { color: '#30363d' } },
+      },
+      plugins: { legend: { labels: { color: '#e6edf3' } } },
+    },
+  });
+}
+
+load();
+</script>
+</body>
+</html>
