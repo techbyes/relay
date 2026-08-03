@@ -25,7 +25,7 @@ def test_different_keys_have_independent_limits():
 
 def test_budget_blocks_when_exhausted():
     limiter = RateLimiter(fakeredis.FakeRedis(decode_responses=True))
-    limiter.record_spend(key_id=1, cost_usd=9.999)
+    limiter.record_spend(key_id=1, cost_usd=10.5)
 
     with pytest.raises(HTTPException) as exc:
         limiter.check_budget(key_id=1, monthly_budget_usd=10.0)
