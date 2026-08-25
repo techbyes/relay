@@ -1,75 +1,64 @@
-# Relay — a small, honest LLM gateway
+# Relay
 
-Relay is a unified proxy that sits in front of multiple LLM providers (OpenAI, Anthropic)
-behind a single API, with virtual API keys, per-key rate limiting and budgets, automatic
-failover, and a cost dashboard. It's a scaled-down, junior-appropriate version of what
-products like Portkey, LiteLLM, and Cloudflare AI Gateway do commercially.
+Relay is a small proxy that sits in front of OpenAI and Anthropic and exposes them
+through a single API. It handles virtual API keys, per-key rate limits and budgets,
+automatic failover if a provider goes down, and a dashboard for tracking cost.
 
-This is a portfolio project. It is architected the way a production system would be,
-but it has **not** been run at production scale — see [Known limitations](#known-limitations)
-for exactly where the line is, instead of overclaiming.
+I built this as a portfolio project after noticing that any team using more than one
+LLM provider ends up solving the same problems over and over: different SDKs, different
+auth, no single place to see spend, no fallback when a provider has an outage. Relay
+solves that once, behind one endpoint. It's not running at real production scale — see
+Known limitations below for what that actually means.
 
-## Why this exists
-
-Any team using more than one LLM provider re-solves the same problems: different SDKs,
-different auth schemes, no unified view of spend, no automatic fallback when a provider
-has an outage. Relay solves this once, behind one OpenAI-compatible-ish endpoint.
-
-## Architecture
+## How a request moves through it
 
 ```
 client
   │  POST /v1/chat/completions   (Authorization: Bearer sk-relay-...)
   ▼
-auth.py          — resolve virtual key → ApiKey row, reject if invalid/inactive
+auth.py          - looks up the virtual key, rejects if invalid/inactive
   ▼
-rate_limit.py    — Redis: per-minute request cap + monthly budget check
+rate_limit.py    - checks Redis for per-minute request cap + monthly budget
   ▼
-router.py        — try providers in configured order, fail over on error
+router.py        - tries providers in order, fails over to the next on error
   ▼
-providers/*.py   — translate the unified request into each provider's own
-                   wire format, stream the response back, translate deltas
-                   into a unified ChatChunk
+providers/*.py   - translates the request into each provider's own format,
+                   streams the response back, converts it into one shared
+                   ChatChunk shape
   ▼
-telemetry.py     — compute cost from token usage, persist to Postgres,
-                   update the Redis spend counter
+telemetry.py     - works out the cost from token usage, saves it to Postgres,
+                   updates the Redis spend counter
   ▼
-client (SSE stream) + /v1/usage/summary + /dashboard (cost charts)
+client (SSE stream) + /v1/usage/summary + /dashboard
 ```
 
-Every request flows through exactly these five stages, in this order. That's the entire
-system — no message queue, no separate worker fleet, because at this scale a synchronous
-in-process pipeline is simpler and just as correct.
+That's the whole pipeline, five steps, always in this order. No message queue or
+worker fleet - at this size a plain synchronous flow is simpler and works fine.
 
-## Key design decisions (and their trade-offs)
+## A few things worth explaining
 
-**Streaming failover only covers the first chunk.**
-`router.py` calls the first provider, and if it raises *before yielding anything*, moves
-to the next one. Once a single chunk has reached the client, no more failover happens —
-you can't un-send bytes that already went out over the wire. This is a genuine constraint
-of streaming systems, not a shortcut: a request/response (non-streaming) gateway could
-retry a failed request from scratch on any provider; a streaming one can't, once it's
-started talking.
+**Failover only works before the first chunk is sent.** `router.py` tries the first
+provider, and if it fails before sending anything back, it moves to the next one. But
+once one chunk has reached the client, that's it - you can't take back bytes that
+already went out over the wire. A non-streaming gateway could just retry the whole
+request on a different provider; a streaming one can't once it's started talking.
 
-**Budget checks are approximate, not exact.**
-The real cost of a request is only known after the provider finishes and reports token
-usage. `rate_limit.py` checks spend *as of the start of the request*, so a single
-in-flight request can push total spend slightly past budget before the next one gets
-blocked. A stricter design would reserve an estimated cost up front and reconcile
-afterwards — that's real added complexity for a marginal accuracy gain at this scale, so
-it's documented here instead of solved.
+**Budget checks aren't exact.** The real cost of a request is only known once the
+provider finishes and reports token usage, but `rate_limit.py` checks spend at the
+*start* of the request. So a request that's already in flight can push spend slightly
+over budget before the next one gets blocked. Reserving an estimated cost upfront and
+reconciling afterward would fix this, but felt like overkill for a project this size.
 
-**Virtual keys, never real ones, cross the wire to callers.**
-`ApiKey.virtual_key` is what a client sees and sends; the real OpenAI/Anthropic keys live
-only in server config. Revoking a caller's access is flipping `is_active` to `False`, with
-no need to rotate the real provider key.
+**Real provider keys never leave the server.** Clients only ever see `virtual_key`
+(e.g. `sk-relay-demo`) - the actual OpenAI/Anthropic keys stay in server config.
+Revoking someone's access is just flipping `is_active` to `False`.
 
-**One bug I hit while building this:** the FastAPI `TestClient` triggers the app's
-lifespan/startup event (which calls `init_db()` against the real Postgres URL from
-settings) *only* when used as a context manager (`with TestClient(app) as c:`). Using it
-without the `with` block skips lifespan entirely. Early test runs were hanging trying to
-connect to a Postgres instance that wasn't running. Fix: tests use a fixture-created
-SQLite engine directly and never trigger the app's own startup event — see
+**A bug I ran into:** FastAPI's `TestClient` only runs the app's startup code (which
+calls `init_db()` against the real Postgres URL) when you use it as a context manager
+(`with TestClient(app) as c:`). Without the `with`, startup gets skipped silently. My
+first test runs kept hanging because they were trying to reach a Postgres instance
+that wasn't running, and it took a while to figure out why. Fixed it by having tests
+build their own SQLite engine directly instead of relying on the app's startup - see
 `tests/conftest.py`.
 
 ## Running it
@@ -81,8 +70,7 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Then seed a virtual API key (there's no signup flow — this is infrastructure, not a
-product with a UI for that yet):
+There's no signup flow yet, so add a virtual key by hand:
 
 ```bash
 docker compose exec postgres psql -U relay -d relay -c \
@@ -90,7 +78,7 @@ docker compose exec postgres psql -U relay -d relay -c \
    VALUES ('sk-relay-demo', 'demo', 10.0, 20, true, now());"
 ```
 
-Call it:
+Then call it:
 
 ```bash
 curl -N http://localhost:8000/v1/chat/completions \
@@ -99,7 +87,7 @@ curl -N http://localhost:8000/v1/chat/completions \
   -d '{"model": "claude-3-5-haiku-20241022", "messages": [{"role": "user", "content": "Say hi in five words."}]}'
 ```
 
-Open `http://localhost:8000/dashboard` to see cost by provider/model/day.
+`http://localhost:8000/dashboard` shows cost broken down by provider/model/day.
 
 ## Running the tests
 
@@ -109,21 +97,21 @@ pip install -r requirements.txt
 pytest -v
 ```
 
-Tests don't call real providers or need Postgres/Redis running — `fakeredis` stands in
-for Redis, an in-memory SQLite engine stands in for Postgres, and the router failover
-tests use fake in-repo `Provider` implementations instead of real HTTP calls.
+Tests don't touch real providers or need Postgres/Redis running: `fakeredis` stands in
+for Redis, SQLite in memory stands in for Postgres, and the failover tests use fake
+`Provider` implementations instead of hitting real APIs.
 
 ## Known limitations
 
-- No auth/rate-limit/budget checks are enforced *between* the request being accepted and
-  the provider call starting except what's described above — there's no distributed lock,
-  so extremely concurrent requests from the same key could both pass the budget check
-  before either one's cost is recorded. Acceptable at this scale; would need a different
-  design (e.g. a reservation system) at high concurrency.
+- There's no lock between "budget check passed" and "cost gets recorded," so two
+  requests from the same key firing at almost the same instant could both pass the
+  budget check before either one's cost lands. Fine at this scale; would need a
+  reservation system to handle it properly under real concurrency.
 - `/v1/usage/summary` uses Postgres' `date_trunc`, so it only works against the real
-  Postgres database, not the SQLite database used in tests.
-- Only two providers are implemented (OpenAI, Anthropic). Adding a third means writing one
-  more file in `app/providers/` that implements the `Provider` interface in `base.py` —
-  no other file needs to change except the registry in `main.py`.
-- No load test numbers are published yet — the honest status is "correct, production-shaped
-  architecture," not "verified under production load."
+  database - not the SQLite one used in tests.
+- Only OpenAI and Anthropic are wired up. Adding another provider means writing one
+  file in `app/providers/` implementing the `Provider` interface in `base.py`, plus
+  registering it in `main.py`.
+- I haven't load-tested this. It's built the way a production service would be, but
+  "built correctly" and "verified under load" are different claims, and I'm only
+  making the first one.
